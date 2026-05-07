@@ -1,34 +1,38 @@
-use chat_app::state::*;
-use futures::stream::SplitSink;
-use futures_util::SinkExt;
-use futures_util::StreamExt;
-use serde::Deserialize;
-use serde::Serialize;
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::io;
-use std::sync::Arc;
-use tokio::net::TcpListener;
-use tokio::net::TcpStream;
-use tokio::runtime::Id;
-use tokio::sync::Mutex;
-use tokio_tungstenite::WebSocketStream;
+use std::{net::SocketAddr, sync::Arc};
+
+use axum::{
+    extract::{
+        ConnectInfo, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
+    response::IntoResponse,
+};
+use axum_extra::{TypedHeader, headers};
+use futures::StreamExt;
+use tokio::{net::TcpStream, sync::mpsc::UnboundedReceiver};
 use tokio_tungstenite::accept_async;
-use tokio_tungstenite::tungstenite::Message;
+
+use crate::state::{ClientReader, ClientWriter, ServerState};
 
 //convert TCP stream into websocket -> read message -> print
-async fn process_socket(socket: TcpStream, clients: Arc<Mutex<ServerState>>, id: u64) {
+async fn process_socket(socket: TcpStream, state: Arc<ServerState>) {
     //take tcp and try to transform into websocket
     let ws_stream = match accept_async(socket).await {
         Ok(ws) => ws,
         Err(e) => {
-            println!("WebSocket handshake failed: {:?}", e);
+            eprintln!("WebSocket handshake failed: {:?}", e);
             return;
         }
     };
+
     //splits ws stream into a read and a write, write will push messages into hashmap and sending. reader will loop over messages
 
-    let (writer, mut reader) = ws_stream.split();
+    let (writer, reader) = ws_stream.split();
+    let writer = ClientWriter::new(writer);
+    let reader = ClientReader::new(reader);
+
+    let client_id = state.create_client(writer, reader);
+
     //locks mutex, returns result(MutexGuard) which gives access to the Vec, then push writer into vec
     //registers the clients to shared list
     //since this tokio mutex is made for async use, use await to lock
@@ -133,27 +137,58 @@ async fn process_socket(socket: TcpStream, clients: Arc<Mutex<ServerState>>, id:
     let _ = clients.lock().await.remove(&id);
 }
 
-#[tokio::main] //creates async runtime 
-async fn main() -> io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:2345").await?;
-
-    let server_state = ServerState {
-        writers: HashMap::new(),
-        room_client: HashMap::new(),
-        chat_room: HashMap::new(),
+/// The handler for the HTTP request (this gets called when the HTTP request lands at the start
+/// of websocket negotiation). After this completes, the actual switching from HTTP to
+/// websocket protocol will occur.
+/// This is the last point where we can extract TCP/IP metadata such as IP address of the client
+/// as well as things from HTTP headers such as user-agent of the browser etc.
+pub(super) async fn ws_handler(
+    ws: WebSocketUpgrade,
+    user_agent: Option<TypedHeader<headers::UserAgent>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    state: axum::extract::State<Arc<ServerState>>,
+) -> impl IntoResponse {
+    let user_agent = if let Some(TypedHeader(user_agent)) = user_agent {
+        user_agent.to_string()
+    } else {
+        String::from("Unknown browser")
     };
+    println!("`{user_agent}` at {addr} connected.");
+    // finalize the upgrade process by returning upgrade callback.
+    // we can customize the callback by sending additional info such as address.
+    ws.on_upgrade(move |socket| handle_socket(socket, addr, state.0))
+}
 
-    //Hashmap that contains ids and clients for broadcasting messages
-    let v_clients: Arc<Mutex<ServerState>> = Arc::new(Mutex::new(server_state));
+async fn handle_socket(mut socket: WebSocket, who: SocketAddr, state: Arc<ServerState>) {
+    let (writer, reader) = socket.split();
+    let mut writer = ClientWriter::new(writer);
+    let mut reader = ClientReader::new(reader);
 
-    let mut id = 0;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let client_id = state.create_client(tx);
 
     loop {
-        let (socket, _) = listener.accept().await?;
-        //cloning creates a new handle pointing to the same list so every task shares the same data without consuming it
-        let clients = Arc::clone(&v_clients);
-        //passing clients so that each task can have access to the shared list and add its own writer and broadcast their message. no isolation.
-        tokio::spawn(process_socket(socket, clients, id)); //enables concurrency, dont have to wait to accept next client 
-        id += 1;
+        // Awaiting 2 futures at the same time
+        tokio::select! {
+            res = send_messages_to_client(&mut rx, &mut writer) => {},
+            res = receive_messages_from_client(&mut reader) => {}
+        }
     }
+}
+
+async fn send_messages_to_client(
+    receiver: &mut UnboundedReceiver<Message>,
+    client: &mut ClientWriter,
+) -> anyhow::Result<()> {
+    if let Some(msg) = receiver.recv().await {
+        // send message to client
+        client.send(msg).await?;
+    }
+    Ok(())
+}
+
+async fn receive_messages_from_client(reader: &mut ClientReader) -> anyhow::Result<()> {
+    if let Some(msg) = reader.recv().await? {}
+    Ok(())
 }
