@@ -1,141 +1,16 @@
-use std::{net::SocketAddr, sync::Arc};
-
+use crate::state::{ClientReader, ClientWriter, Incoming, Outgoing, ServerState};
+use anyhow;
 use axum::{
     extract::{
         ConnectInfo, WebSocketUpgrade,
-        ws::{Message, WebSocket},
+        ws::{Message, Utf8Bytes, WebSocket},
     },
     response::IntoResponse,
 };
 use axum_extra::{TypedHeader, headers};
 use futures::StreamExt;
-use tokio::{net::TcpStream, sync::mpsc::UnboundedReceiver};
-use tokio_tungstenite::accept_async;
-
-use crate::state::{ClientReader, ClientWriter, ServerState};
-
-//convert TCP stream into websocket -> read message -> print
-async fn process_socket(socket: TcpStream, state: Arc<ServerState>) {
-    //take tcp and try to transform into websocket
-    let ws_stream = match accept_async(socket).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            eprintln!("WebSocket handshake failed: {:?}", e);
-            return;
-        }
-    };
-
-    //splits ws stream into a read and a write, write will push messages into hashmap and sending. reader will loop over messages
-
-    let (writer, reader) = ws_stream.split();
-    let writer = ClientWriter::new(writer);
-    let reader = ClientReader::new(reader);
-
-    let client_id = state.create_client(writer, reader);
-
-    //locks mutex, returns result(MutexGuard) which gives access to the Vec, then push writer into vec
-    //registers the clients to shared list
-    //since this tokio mutex is made for async use, use await to lock
-
-    let mut guard = clients.lock().await;
-    guard.writers.insert(id, writer);
-    drop(guard);
-
-    //first message = username
-
-    //username becomes message
-    let username_msg = match reader.next().await {
-        Some(Ok(msg)) => msg,
-        _ => return,
-    };
-
-    //message -> string
-    let username = match username_msg {
-        Message::Text(text) => text.trim().to_string(),
-        _ => return,
-    };
-
-    //looping forever, reading incoming messages
-    //client sends json string
-    //retriving message string
-    while let Some(msg) = reader.next().await {
-        match msg {
-            Ok(msg) => {
-                println!("Received: {:?}", msg);
-                match msg {
-                    Message::Text(text) => {
-                        //deserializes json text into rust struct (Incoming)
-                        let incoming: Incoming = match serde_json::from_str(text.as_str()) {
-                            Ok(parsed) => parsed,
-                            Err(e) => {
-                                //log the error
-                                println!("{:?}", e);
-                                //lock clients list
-                                let mut guard = clients.lock().await;
-                                // grab this clients by id
-                                if let Some(writer) = guard.writers.get_mut(&id) {
-                                    //send error to user
-                                    let _ = writer.send(Message::Text("invalid JSON".into())).await;
-                                }
-                                //wait for next message
-                                continue;
-                            }
-                        };
-
-                        // instance of outgoing
-
-                        let outgoing = Outgoing {
-                            //.clone() allocates a fresh String with the same contents, hands that to the struct
-                            sender: username.clone().to_string(), //independent copy of string so username is not gone and can be used in next iteration
-                            content: incoming.content,
-                        };
-
-                        //serialize outgoing
-                        let out = serde_json::to_string(&outgoing).unwrap();
-
-                        //handle sending same messages back
-                        //lock clients and access vec
-                        let mut guard = clients.lock().await;
-                        //which room this id is in
-                        let Some(room_name) = guard.room_client.get(&id) else {
-                            println!("No room found, exiting.");
-                            return;
-                        };
-                        //list of ids in the room
-                        let Some(ids) = guard.chat_room.get(room_name) else {
-                            println!("No ids found, exiting.");
-                            return;
-                        };
-
-                        //loop through and grab each writer
-                        for (_, writer) in guard.chat_room.iter_mut() {
-                            //sending serialized json to that client and handling if failed sending message
-                            if let Err(e) = writer
-                                .send(tokio_tungstenite::tungstenite::Message::Text(
-                                    out.clone().into(),
-                                ))
-                                .await
-                            //cloning response for each writer so it does not get consumed by one only
-                            {
-                                println!("Error sending message: {:?}", e);
-
-                                break;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Err(e) => {
-                println!("Error receiving messages: {:?}", e);
-                break;
-            }
-        }
-    }
-
-    //remove this client from the shared list on disconnect
-    let _ = clients.lock().await.remove(&id);
-}
+use std::{net::SocketAddr, sync::Arc};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 /// The handler for the HTTP request (this gets called when the HTTP request lands at the start
 /// of websocket negotiation). After this completes, the actual switching from HTTP to
@@ -158,37 +33,114 @@ pub(super) async fn ws_handler(
     // we can customize the callback by sending additional info such as address.
     ws.on_upgrade(move |socket| handle_socket(socket, addr, state.0))
 }
-
-async fn handle_socket(mut socket: WebSocket, who: SocketAddr, state: Arc<ServerState>) {
+///Per connection task, axum runs one for each connected client, sets up connection by spliting WS into r, w, sets up multi-prod,
+///single consumer chanel, registers, and then select!
+async fn handle_socket(socket: WebSocket, _who: SocketAddr, state: Arc<ServerState>) {
     let (writer, reader) = socket.split();
     let mut writer = ClientWriter::new(writer);
     let mut reader = ClientReader::new(reader);
-
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-
     let client_id = state.create_client(tx);
+    let username = format!("user_{client_id}");
+    let mut current_room: Option<String> = None; //what it means #TODO
 
     loop {
         // Awaiting 2 futures at the same time
         tokio::select! {
-            res = send_messages_to_client(&mut rx, &mut writer) => {},
-            res = receive_messages_from_client(&mut reader) => {}
+            res = send_messages_to_client(&mut rx, &mut writer) => {
+                match res {
+                    Ok(true) => {},
+                    Ok(false) | Err(_) => break,
+                }},
+            res = receive_messages_from_client(&mut reader, &state, client_id, &username, &mut current_room) => {
+                match res {
+                    Ok(true) => {},
+                    Ok(false) | Err(_) => break,
+                }
+            }
         }
     }
+    if let Some(room) = current_room {
+        state.leave_room(&room, client_id);
+    }
+    state.remove_client(client_id);
 }
 
+///Reads from clients channel receiver, and writes to the clients websocket
 async fn send_messages_to_client(
     receiver: &mut UnboundedReceiver<Message>,
     client: &mut ClientWriter,
-) -> anyhow::Result<()> {
-    if let Some(msg) = receiver.recv().await {
+) -> anyhow::Result<bool> {
+    match receiver.recv().await {
         // send message to client
-        client.send(msg).await?;
+        Some(msg) => {
+            client.send(msg).await?;
+            Ok(true)
+        }
+        None => Ok(false),
     }
-    Ok(())
 }
+///Handle one message coming from client per call and will signal to handle socket whether to keep looping or not
+async fn receive_messages_from_client(
+    reader: &mut ClientReader,
+    state: &ServerState,
+    client_id: u64,
+    username: &str,
+    current_room: &mut Option<String>,
+) -> anyhow::Result<bool> {
+    match reader.recv().await? {
+        Some(Message::Text(text)) => {
+            //json string -> rust struct
+            let incoming: Incoming = match serde_json::from_str(&text) {
+                Ok(v) => v,
+                Err(_) => {
+                    state.send_to_client(client_id, Message::Text("invalid JSON".into()));
+                    return Ok(true);
+                }
+            };
 
-async fn receive_messages_from_client(reader: &mut ClientReader) -> anyhow::Result<()> {
-    if let Some(msg) = reader.recv().await? {}
-    Ok(())
+            //handle what type of message the text contained: a join room
+            match incoming {
+                Incoming::Join { room } => {
+                    //leave prev room first (only 1 atp)
+                    if let Some(old) = current_room.take() {
+                        state.leave_room(&old, client_id);
+                    }
+                    state.join_room(room.clone(), client_id);
+                    //why are we cloning
+                    *current_room = Some(room.clone());
+                    state.send_to_client(client_id, Message::Text(format!("joined {room}").into()));
+                }
+                //handle chat message
+                Incoming::Message { content } => {
+                    if content.trim().is_empty() {
+                        state.send_to_client(client_id, Message::Text(Utf8Bytes::from_static("Empty message")),);
+                        return Ok(true);
+                    }
+                    //can only chat if you've joined a room
+                    //if val matches room bind room and carry on, else
+                    let Some(room) = current_room.as_deref() else {
+                        //reach through the option and borrow room name
+                        state.send_to_client(
+                            client_id,
+                            Message::Text(Utf8Bytes::from_static("Join room first")),
+                        );
+                        return Ok(true);
+                    };
+                    //rust struct -> json string
+                    let outgoing = Outgoing {
+                        sender: username.to_string(),
+                        content,
+                    };
+                    let out = serde_json::to_string(&outgoing)?;
+                    state.broadcast_to_room(room, client_id, Message::Text(out.into()));
+                }
+            }
+
+            Ok(true) //signal to keep looping
+        }
+
+        Some(_) => Ok(true), // non-text frames (binary, ping, pong) — ignore
+        None => Ok(false),
+    }
 }

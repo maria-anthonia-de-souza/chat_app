@@ -1,9 +1,10 @@
 mod handler;
 
-use std::{os::macos::raw::stat, sync::Arc};
+use std::sync::Arc;
 
 use axum::{Router, routing::any};
-use tokio::net::{TcpListener, TcpStream};
+use std::net::SocketAddr;
+use tokio::net::TcpListener;
 
 use crate::{server::handler::ws_handler, state::ServerState};
 
@@ -24,7 +25,14 @@ impl Server {
         let app = Router::new()
             .route("/ws", any(ws_handler))
             .with_state(self.state);
-        axum::serve(self.listener, app).await;
+
+        //wires the per-connection client socketAddr into the request, which is what ConnectInfo<SockerAddr> in ws_handler reaches for
+        //make-service: for each incoming tcp connection, produces a service to handle that one connection 
+        axum::serve(
+            self.listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
         Ok(())
     }
 }
