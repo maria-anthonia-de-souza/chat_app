@@ -35,7 +35,7 @@ pub(super) async fn ws_handler(
 }
 ///Per connection task, axum runs one for each connected client, sets up connection by spliting WS into r, w, sets up multi-prod,
 ///single consumer chanel, registers, and then select!
-async fn handle_socket(socket: WebSocket, _who: SocketAddr, state: Arc<ServerState>) {
+async fn handle_socket(socket: WebSocket, who: SocketAddr, state: Arc<ServerState>) {
     let (writer, reader) = socket.split();
     let mut writer = ClientWriter::new(writer);
     let mut reader = ClientReader::new(reader);
@@ -64,6 +64,8 @@ async fn handle_socket(socket: WebSocket, _who: SocketAddr, state: Arc<ServerSta
         state.leave_room(&room, client_id);
     }
     state.remove_client(client_id);
+    println!("{who} disconnected");
+
 }
 
 ///Reads from clients channel receiver, and writes to the clients websocket
