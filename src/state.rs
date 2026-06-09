@@ -37,10 +37,6 @@ impl ChatRoom {
         }
     }
 
-    // pub fn id(&self) -> u64 {
-    //     self.id
-    // }
-
     pub fn add_client(&mut self, client_id: u64) {
         self.clients.insert(client_id);
     }
@@ -185,20 +181,6 @@ impl ServerState {
         self.clients.remove(&client_id);
     }
 
-    // pub fn broadcast_to_all(&self, sender_id: u64, msg: Message) {
-    //     //iterate through clients, skips key that equals senders id and send msg to each remainder id
-
-    //     let ids: Vec<u64> = self
-    //         .clients
-    //         .iter()
-    //         .map(|entry| *entry.key())
-    //         .filter(|id| *id != sender_id)
-    //         .collect();
-
-    //     for client_id in ids{
-    //         self.send_to_client(client_id, msg.clone());
-    //     }  
-    // }
 
     pub fn send_to_client(&self, client_id: u64, msg: Message) {
         if let Some(entry) = self.clients.get(&client_id) {
